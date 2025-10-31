@@ -18,6 +18,7 @@ except ImportError:
         return sorted(items, key=key)
 
 from torchvision.utils import save_image
+from torchvision.transforms import functional as TF
 import pandas as pd
 import seaborn as sns
 
@@ -728,7 +729,7 @@ def umap_visualization(cluster_indices, x, y, save_dir):
         plt.close()
 
 
-def visualize_modes_covariance(eigenvalues, eigenvectors, x_feature, y_feature, num_visual_mode, save_dir, dataset, absolute=False, data_type='image', num_samples_per_mode=50, plot_tsne=True, x=None, y=None, save_file=True, total_variance=True, model_names=('X', 'Y')):
+def visualize_modes_covariance(eigenvalues, eigenvectors, x_feature, y_feature, num_visual_mode, save_dir, dataset=None, absolute=False, data_type='image', num_samples_per_mode=50, plot_tsne=True, x=None, y=None, save_file=True, total_variance=True, model_names=('X', 'Y')):
     """
     Visualizes the top `num_visual_mode` modes.
 
@@ -761,6 +762,120 @@ def visualize_modes_covariance(eigenvalues, eigenvectors, x_feature, y_feature, 
 
     # transform = []
     summary_indexes = {}
+    # Helper to fetch an image by index from various dataset types
+    def _fetch_image(idx):
+        if dataset is None:
+            return None, None
+        item = None
+        try:
+            # List of items
+            if isinstance(dataset, list):
+                item = dataset[idx]
+            else:
+                item = dataset[idx]
+        except Exception:
+            return None, None
+
+        label_str = None
+
+        # If dataset returns (image, label)
+        if isinstance(item, (tuple, list)) and len(item) >= 1:
+            img = item[0]
+            label = item[1] if len(item) > 1 else None
+            if isinstance(label, (int, float, str)):
+                label_str = str(label)
+        else:
+            img = item
+
+        # If path-like
+        if isinstance(img, (str, os.PathLike)):
+            try:
+                from PIL import Image
+                pil_img = Image.open(img).convert('RGB')
+                return pil_img, label_str
+            except Exception:
+                return None, label_str
+
+        # If PIL.Image
+        try:
+            from PIL import Image
+            if isinstance(img, Image.Image):
+                return img, label_str
+        except Exception:
+            pass
+
+        # If tensor
+        if isinstance(img, torch.Tensor):
+            return img, label_str
+
+        # If numpy array (H,W,3) or (3,H,W)
+        if isinstance(img, np.ndarray):
+            t = torch.from_numpy(img)
+            return t, label_str
+
+        return None, label_str
+
+    def _to_tensor(img):
+        # Convert different image types to CHW float tensor in [0,1]
+        if img is None:
+            return None
+        if isinstance(img, torch.Tensor):
+            t = img
+            if t.dim() == 3 and t.shape[0] in (1, 3):
+                # assume already CHW
+                pass
+            elif t.dim() == 3 and t.shape[-1] in (1, 3):
+                t = t.permute(2, 0, 1)
+            elif t.dim() == 2:
+                t = t.unsqueeze(0)
+            # Normalize to [0,1] if looks like [0,255]
+            if t.dtype != torch.float32:
+                t = t.float()
+            if t.max() > 1.0:
+                t = t / 255.0
+            # If in [-1,1], map to [0,1]
+            if t.min() < 0.0:
+                t = (t + 1.0) / 2.0
+            return t.clamp(0, 1)
+        # PIL image
+        try:
+            from PIL import Image
+            if isinstance(img, Image.Image):
+                return TF.to_tensor(img)
+        except Exception:
+            pass
+        return None
+
+    def _save_grid(tensors, path, nrow):
+        if len(tensors) == 0:
+            return
+        # determine a common target size (H, W) based on the first tensor
+        first = tensors[0]
+        if not isinstance(first, torch.Tensor) or first.dim() != 3:
+            # attempt to convert anything unexpected
+            conv = [_to_tensor(t) for t in tensors]
+            conv = [t for t in conv if isinstance(t, torch.Tensor) and t.dim() == 3]
+            if len(conv) == 0:
+                return
+            first = conv[0]
+            tensors = conv
+        target_size = (first.shape[1], first.shape[2])
+        resized = []
+        for t in tensors:
+            if not isinstance(t, torch.Tensor) or t.dim() != 3:
+                t = _to_tensor(t)
+            if t is None:
+                continue
+            if t.shape[1:] != target_size:
+                try:
+                    t = TF.resize(t, target_size, antialias=True)
+                except TypeError:
+                    # antialias not available in older torchvision
+                    t = TF.resize(t, target_size)
+            resized.append(t)
+        if len(resized) > 0:
+            save_image(resized, path, nrow=nrow)
+
     for i in range(num_visual_mode):
 
         top_eigenvector = eigenvectors[:, max_id[i]]
@@ -787,16 +902,20 @@ def visualize_modes_covariance(eigenvalues, eigenvectors, x_feature, y_feature, 
             summary = []
             summary_indexes[i] = []
             for j, top_image_id in enumerate(top_image_ids[:num_samples_per_mode]):
-                idx = top_image_id
-                if save_file is True and j < 16:
-                    top_img = dataset[idx][0]
-                    save_image(top_img, os.path.join(save_folder_name, f'{j}_ref_{str(dataset[idx][1])[:5]}.jpg'), nrow=1)
-                    summary.append(top_img)
-                summary_indexes[i].append(int(idx))
+                idx = int(top_image_id)
+                if save_file is True and j < 16 and dataset is not None:
+                    img, label_str = _fetch_image(idx)
+                    t = _to_tensor(img)
+                    if t is not None:
+                        suffix = f"_{label_str[:5]}" if isinstance(label_str, str) else ""
+                        save_image(t, os.path.join(save_folder_name, f'{j}_ref{suffix}.jpg'), nrow=1)
+                        summary.append(t)
+                summary_indexes[i].append(idx)
             if save_file is True:
-                save_image(summary, os.path.join(save_dir, f'mode={i}_summary.jpg'), nrow=4)
-                save_image(summary[:9], os.path.join(save_dir, f'mode={i}_summary_3.jpg'), nrow=3)
-                save_image(summary[:4], os.path.join(save_dir, f'mode={i}_summary_3.jpg'), nrow=2)
+                if len(summary) > 0:
+                    _save_grid(summary, os.path.join(save_dir, f'mode={i}_summary.jpg'), nrow=4)
+                    _save_grid(summary[:9], os.path.join(save_dir, f'mode={i}_summary_3.jpg'), nrow=3)
+                    _save_grid(summary[:4], os.path.join(save_dir, f'mode={i}_summary_2.jpg'), nrow=2)
 
         elif data_type == 'text':
             assert type(dataset) == list
@@ -846,12 +965,13 @@ def visualize_modes_covariance(eigenvalues, eigenvectors, x_feature, y_feature, 
 
     if plot_tsne is True:
         if x is None or y is None:
-            raise ValueError("x or y can not be None when plotting T-SNE")
-        tsne_visulization(summary_indexes, x=x, y=y, save_dir=save_dir)
-        pacmap_visualization(summary_indexes, x=x, y=y, save_dir=save_dir)
-        umap_visualization(summary_indexes, x=x, y=y, save_dir=save_dir)
-        violin_visualization(summary_indexes, x, os.path.join(save_dir, 'violin_x.png'), n_clusters=num_visual_mode, points_per_cluster=num_samples_per_mode)
-        violin_visualization(summary_indexes, y, os.path.join(save_dir, 'violin_y.png'), n_clusters=num_visual_mode, points_per_cluster=num_samples_per_mode)
-        plot_combined_violin_clusters(x, y, summary_indexes, summary_indexes, os.path.join(save_dir, 'violin_xy.png'), n_clusters=num_visual_mode, model_names=model_names, colors='reverse')
-        KMeans_validation(summary_indexes, x, y)
+            print("[Warn] x or y not provided; skipping t-SNE/violin/KMeans visualizations.")
+        else:
+            tsne_visulization(summary_indexes, x=x, y=y, save_dir=save_dir)
+            pacmap_visualization(summary_indexes, x=x, y=y, save_dir=save_dir)
+            umap_visualization(summary_indexes, x=x, y=y, save_dir=save_dir)
+            violin_visualization(summary_indexes, x, os.path.join(save_dir, 'violin_x.png'), n_clusters=num_visual_mode, points_per_cluster=num_samples_per_mode)
+            violin_visualization(summary_indexes, y, os.path.join(save_dir, 'violin_y.png'), n_clusters=num_visual_mode, points_per_cluster=num_samples_per_mode)
+            plot_combined_violin_clusters(x, y, summary_indexes, summary_indexes, os.path.join(save_dir, 'violin_xy.png'), n_clusters=num_visual_mode, model_names=model_names, colors='reverse')
+            KMeans_validation(summary_indexes, x, y)
     return summary_indexes

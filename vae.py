@@ -50,14 +50,61 @@ class AutoencoderKL(pl.LightningModule):
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
 
     def init_from_ckpt(self, path, ignore_keys=list()):
-        sd = torch.load(path, map_location="cpu")["state_dict"]
+        """
+        Load checkpoint weights from either:
+        - .safetensors: load tensor dict directly
+        - .ckpt/.pt/.bin: torch.load() which may contain {'state_dict': ...} or a flat dict
+
+        Notes:
+        - PyTorch 2.6 changed torch.load default weights_only=True; we handle this by
+          retrying with weights_only=False if required.
+        - We load with strict=False to be resilient to minor key mismatches.
+        """
+
+        sd = None
+        path_str = str(path)
+
+        if path_str.endswith('.safetensors'):
+            try:
+                from safetensors.torch import load_file as safe_load_file
+            except Exception as e:
+                raise RuntimeError(
+                    "safetensors is required to load .safetensors checkpoints. Install via `pip install safetensors`."
+                ) from e
+            sd = safe_load_file(path_str, device="cpu")
+        else:
+            # Torch serialized checkpoint
+            ckpt = None
+            try:
+                ckpt = torch.load(path_str, map_location="cpu")
+            except Exception as e:
+                # Retry with weights_only=False for PyTorch>=2.6 compatibility
+                try:
+                    ckpt = torch.load(path_str, map_location="cpu", weights_only=False)
+                except Exception as e2:
+                    raise e2
+
+            if isinstance(ckpt, dict) and "state_dict" in ckpt:
+                sd = ckpt["state_dict"]
+            elif isinstance(ckpt, dict):
+                # Assume it's already a state dict
+                sd = ckpt
+            else:
+                raise ValueError("Unsupported checkpoint format: expected dict or dict with 'state_dict'.")
+
+        # Apply ignore_keys filtering
         keys = list(sd.keys())
         for k in keys:
             for ik in ignore_keys:
                 if k.startswith(ik):
                     print("Deleting key {} from state_dict.".format(k))
                     del sd[k]
-        self.load_state_dict(sd, strict=False)
+
+        missing, unexpected = self.load_state_dict(sd, strict=False)
+        if missing:
+            print(f"Missing keys while loading: {len(missing)} examples: {missing[:5]}")
+        if unexpected:
+            print(f"Unexpected keys while loading: {len(unexpected)} examples: {unexpected[:5]}")
         print(f"Restored from {path}")
 
     @contextmanager
